@@ -2,6 +2,7 @@
 import logging
 
 import voluptuous as vol
+from enum import Enum
 
 from datetime import timedelta
 
@@ -39,6 +40,7 @@ CONF_SEND_STOP_AT_ENDS = 'send_stop_at_ends'
 DEFAULT_TRAVEL_TIME = 25
 DEFAULT_SEND_STOP_AT_ENDS = False
 
+CONF_COVER_ENTITY_ID = 'cover_entity_id'
 CONF_OPEN_SWITCH_ENTITY_ID = 'open_switch_entity_id'
 CONF_CLOSE_SWITCH_ENTITY_ID = 'close_switch_entity_id'
 ATTR_CONFIDENT = 'confident'
@@ -57,8 +59,9 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
             {
                 cv.string: {
                     vol.Required(CONF_NAME): cv.string,
-                    vol.Required(CONF_OPEN_SWITCH_ENTITY_ID): cv.entity_id,
-                    vol.Required(CONF_CLOSE_SWITCH_ENTITY_ID): cv.entity_id,
+                    vol.Optional(CONF_COVER_ENTITY_ID): cv.entity_id,
+                    vol.Optional(CONF_OPEN_SWITCH_ENTITY_ID): cv.entity_id,
+                    vol.Optional(CONF_CLOSE_SWITCH_ENTITY_ID): cv.entity_id,
                     vol.Optional(CONF_ALIASES, default=[]): vol.All(cv.ensure_list, [cv.string]),
                     vol.Optional(CONF_TRAVELLING_TIME_DOWN, default=DEFAULT_TRAVEL_TIME): cv.positive_int,
                     vol.Optional(CONF_TRAVELLING_TIME_UP, default=DEFAULT_TRAVEL_TIME): cv.positive_int,
@@ -87,7 +90,8 @@ ACTION_SCHEMA = vol.Schema(
 )
 
 
-DOMAIN = "cover_time_based_synced"
+DOMAIN = "cover_synced"
+
 
 def devices_from_config(domain_config):
     """Parse configuration and add cover devices."""
@@ -96,13 +100,13 @@ def devices_from_config(domain_config):
         name = config.pop(CONF_NAME)
         travel_time_down = config.pop(CONF_TRAVELLING_TIME_DOWN)
         travel_time_up = config.pop(CONF_TRAVELLING_TIME_UP)
-        open_switch_entity_id = config.pop(CONF_OPEN_SWITCH_ENTITY_ID)
-        close_switch_entity_id = config.pop(CONF_CLOSE_SWITCH_ENTITY_ID)
+        cover_entity_id = config.pop(CONF_COVER_ENTITY_ID, None)
+        open_switch_entity_id = config.pop(CONF_OPEN_SWITCH_ENTITY_ID, None)
+        close_switch_entity_id = config.pop(CONF_CLOSE_SWITCH_ENTITY_ID, None)
         send_stop_at_ends = config.pop(CONF_SEND_STOP_AT_ENDS)
-        device = CoverTimeBased(device_id, name, travel_time_down, travel_time_up, open_switch_entity_id, close_switch_entity_id, send_stop_at_ends)
+        device = CoverTimeBased(device_id, name, travel_time_down, travel_time_up, cover_entity_id, open_switch_entity_id, close_switch_entity_id, send_stop_at_ends)
         devices.append(device)
     return devices
-
 
 
 async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
@@ -120,18 +124,30 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
     )
 
 
+class CoverControlMode(Enum):
+    cover_controlled = 'cover_controlled'
+    switch_controlled = 'switch_controlled'
+
+
 class CoverTimeBased(CoverEntity, RestoreEntity):
-    def __init__(self, device_id, name, travel_time_down, travel_time_up, open_switch_entity_id, close_switch_entity_id, send_stop_at_ends):
+    def __init__(self, device_id, name, travel_time_down, travel_time_up, cover_entity_id, open_switch_entity_id, close_switch_entity_id, send_stop_at_ends):
         """Initialize the cover."""
         self._travel_time_down = travel_time_down
         self._travel_time_up = travel_time_up
+        self._cover_entity_id = cover_entity_id
         self._open_switch_entity_id = open_switch_entity_id
         self._close_switch_entity_id = close_switch_entity_id
         self._send_stop_at_ends = send_stop_at_ends
-        self._assume_uncertain_position = True 
+        self._assume_uncertain_position = True
         self._target_position = 0
         self._processing_known_position = False
         self._unique_id = device_id
+
+        # Only allow cover or switch entities
+        if self._cover_entity_id is not None and (self._open_switch_entity_id or self._close_switch_entity_id):
+            raise Exception('You need to define a cover entity or open and close switch entities')
+
+        self._cover_control_mode = CoverControlMode.cover_controlled if self._cover_entity_id is not None else CoverControlMode.switch_controlled
 
         if name:
             self._name = name
@@ -144,6 +160,7 @@ class CoverTimeBased(CoverEntity, RestoreEntity):
 
         self._switch_close_state = "off"
         self._switch_open_state = "off"
+        self._cover_state = "closed"
 
     async def _handle_state_changed(self, event):
         if event.data.get("new_state") is None:
@@ -155,7 +172,14 @@ class CoverTimeBased(CoverEntity, RestoreEntity):
         if event.data.get("new_state").state == event.data.get("old_state").state:
             return
 
-        if event.data.get("entity_id") == self._close_switch_entity_id:
+        # Cover entity
+        if event.data.get("entity_id") == self._cover_entity_id:
+            if self._cover_state == event.data.get("new_state").state:
+                return
+            self._cover_state = event.data.get("new_state").state
+
+        # Switch entity
+        elif event.data.get("entity_id") == self._close_switch_entity_id:
             if self._switch_close_state == event.data.get("new_state").state:
                 return
             self._switch_close_state = event.data.get("new_state").state
@@ -163,20 +187,46 @@ class CoverTimeBased(CoverEntity, RestoreEntity):
             if self._switch_open_state == event.data.get("new_state").state:
                 return
             self._switch_open_state = event.data.get("new_state").state
+        # Ignore state
         else:
             return
 
-        if self._switch_open_state == "off" and self._switch_close_state == "off":
-            _LOGGER.debug(self._name + ': ' + 'open/close: off/off, stopping')
+        # Evaluate state
+        action = ""
+        if self._cover_control_mode == CoverControlMode.cover_controlled:
+            if event.data.get("new_state").state == "open" or event.data.get("new_state").state == "closed":
+                _LOGGER.debug(self._name + ': ' + 'cover stopped')
+                action = "stop"
+            if event.data.get("new_state").state == "opening":
+                _LOGGER.debug(self._name + ': ' + 'cover opening')
+                action = "moving_up"
+            if event.data.get("new_state").state == "closing":
+                _LOGGER.debug(self._name + ': ' + 'cover closing')
+                action = "moving_down"
+
+        elif self._cover_control_mode == CoverControlMode.switch_controlled:
+            if self._switch_open_state == "off" and self._switch_close_state == "off":
+                _LOGGER.debug(self._name + ': ' + 'open/close: off/off, stopping')
+                action = "stop"
+
+            elif self._switch_open_state == "on" and self._switch_close_state == "on":
+                _LOGGER.debug(self._name + ': ' + 'open/close: on/on, turning off both switches')
+                action = "stop"
+                if event.data.get("entity_id") == self._close_switch_entity_id:
+                    await self.hass.services.async_call("homeassistant", "turn_off", {"entity_id": self._open_switch_entity_id}, False)
+                if event.data.get("entity_id") == self._open_switch_entity_id:
+                    await self.hass.services.async_call("homeassistant", "turn_off", {"entity_id": self._close_switch_entity_id}, False)
+
+            elif self._switch_open_state == "on" and self._switch_close_state == "off":
+                action = "moving_up"
+
+            elif self._switch_open_state == "off" and self._switch_close_state == "on":
+                action = "moving_down"
+
+        # Set state
+        if action == "stop":
             self._handle_my_button()
-        elif self._switch_open_state == "on" and self._switch_close_state == "on":
-            _LOGGER.debug(self._name + ': ' + 'open/close: on/on, turning off both switches')
-            self._handle_my_button()
-            if event.data.get("entity_id") == self._close_switch_entity_id:
-                await self.hass.services.async_call("homeassistant", "turn_off", {"entity_id": self._open_switch_entity_id}, False)
-            if event.data.get("entity_id") == self._open_switch_entity_id:
-                await self.hass.services.async_call("homeassistant", "turn_off", {"entity_id": self._close_switch_entity_id}, False)
-        elif self._switch_open_state == "on" and self._switch_close_state == "off":
+        elif action == "moving_up":
             if self._target_position != 100 and self._target_position != 0:
                 _LOGGER.debug(self._name + ': ' + 'open/close: on/off, opening to %d', self._target_position)
                 self.tc.start_travel(self._target_position)
@@ -184,8 +234,9 @@ class CoverTimeBased(CoverEntity, RestoreEntity):
                 _LOGGER.debug(self._name + ': ' + 'open/close: on/off, opening to predefined 100')
                 self._target_position = 100
                 self.tc.start_travel_up()
+
             self.start_auto_updater()
-        elif self._switch_open_state == "off" and self._switch_close_state == "on":
+        elif action == "moving_down":
             if self._target_position != 100 and self._target_position != 0:
                 _LOGGER.debug(self._name + ': ' + 'open/close: on/off, closing to %d', self._target_position)
                 self.tc.start_travel(self._target_position)
@@ -194,7 +245,6 @@ class CoverTimeBased(CoverEntity, RestoreEntity):
                 self._target_position = 0
                 self.tc.start_travel_down()
             self.start_auto_updater()
-            
 
     async def async_added_to_hass(self):
         """ Only cover position and confidence in that matters."""
@@ -205,11 +255,10 @@ class CoverTimeBased(CoverEntity, RestoreEntity):
         if (old_state is not None and self.tc is not None and old_state.attributes.get(ATTR_CURRENT_POSITION) is not None):
             self.tc.set_position(int(old_state.attributes.get(ATTR_CURRENT_POSITION)))
         if (old_state is not None and old_state.attributes.get(ATTR_UNCONFIRMED_STATE) is not None):
-         if type(old_state.attributes.get(ATTR_UNCONFIRMED_STATE)) == bool:
-           self._assume_uncertain_position = old_state.attributes.get(ATTR_UNCONFIRMED_STATE)
-         else:
-           self._assume_uncertain_position = str(old_state.attributes.get(ATTR_UNCONFIRMED_STATE)) == str(True)
-
+            if type(old_state.attributes.get(ATTR_UNCONFIRMED_STATE)) == bool:
+                self._assume_uncertain_position = old_state.attributes.get(ATTR_UNCONFIRMED_STATE)
+            else:
+                self._assume_uncertain_position = str(old_state.attributes.get(ATTR_UNCONFIRMED_STATE)) == str(True)
 
     def _handle_my_button(self):
         """Handle the MY button press"""
@@ -240,7 +289,7 @@ class CoverTimeBased(CoverEntity, RestoreEntity):
         if self._travel_time_down is not None:
             attr[CONF_TRAVELLING_TIME_DOWN] = self._travel_time_down
         if self._travel_time_up is not None:
-            attr[CONF_TRAVELLING_TIME_UP] = self._travel_time_up 
+            attr[CONF_TRAVELLING_TIME_UP] = self._travel_time_up
         attr[ATTR_UNCONFIRMED_STATE] = str(self._assume_uncertain_position)
         return attr
 
@@ -253,13 +302,13 @@ class CoverTimeBased(CoverEntity, RestoreEntity):
     def is_opening(self):
         """Return if the cover is opening or not."""
         return self.tc.is_traveling() and \
-               self.tc.travel_direction == TravelStatus.DIRECTION_UP
+            self.tc.travel_direction == TravelStatus.DIRECTION_UP
 
     @property
     def is_closing(self):
         """Return if the cover is closing or not."""
         return self.tc.is_traveling() and \
-               self.tc.travel_direction == TravelStatus.DIRECTION_DOWN
+            self.tc.travel_direction == TravelStatus.DIRECTION_DOWN
 
     @property
     def is_closed(self):
@@ -270,13 +319,13 @@ class CoverTimeBased(CoverEntity, RestoreEntity):
     def assumed_state(self):
         """Return True unless we have set position with confidence through send_know_position service."""
         return self._assume_uncertain_position
- 
+
     async def async_set_cover_position(self, **kwargs):
-       """Move the cover to a specific position."""
-       if ATTR_POSITION in kwargs:
-           self._target_position = kwargs[ATTR_POSITION]
-           _LOGGER.debug(self._name + ': ' + 'async_set_cover_position: %d', self._target_position)
-           await self.set_position(self._target_position)
+        """Move the cover to a specific position."""
+        if ATTR_POSITION in kwargs:
+            self._target_position = kwargs[ATTR_POSITION]
+            _LOGGER.debug(self._name + ': ' + 'async_set_cover_position: %d', self._target_position)
+            await self.set_position(self._target_position)
 
     async def async_close_cover(self, **kwargs):
         """Turn the device close."""
@@ -347,17 +396,17 @@ class CoverTimeBased(CoverEntity, RestoreEntity):
     async def set_known_action(self, **kwargs):
         """We want to do a few things when we get a position"""
         action = kwargs[ATTR_ACTION]
-        if action not in ["open","close","stop"]:
-          raise ValueError("action must be one of open, close or cover.")
+        if action not in ["open", "close", "stop"]:
+            raise ValueError("action must be one of open, close or cover.")
         if action == "stop":
-          self._handle_my_button()
-          return
+            self._handle_my_button()
+            return
         if action == "open":
-          self.tc.start_travel_up()
-          self._target_position = 100
+            self.tc.start_travel_up()
+            self._target_position = 100
         if action == "close":
-          self.tc.start_travel_down()
-          self._target_position = 0
+            self.tc.start_travel_down()
+            self._target_position = 0
         self.start_auto_updater()
 
     async def set_known_position(self, **kwargs):
@@ -366,26 +415,25 @@ class CoverTimeBased(CoverEntity, RestoreEntity):
         confident = kwargs[ATTR_CONFIDENT] if ATTR_CONFIDENT in kwargs else False
         position_type = kwargs[ATTR_POSITION_TYPE] if ATTR_POSITION_TYPE in kwargs else ATTR_POSITION_TYPE_TARGET
         if position_type not in [ATTR_POSITION_TYPE_TARGET, ATTR_POSITION_TYPE_CURRENT]:
-          raise ValueError(ATTR_POSITION_TYPE + " must be one of %s, %s", ATTR_POSITION_TYPE_TARGET,ATTR_POSITION_TYPE_CURRENT)
+            raise ValueError(ATTR_POSITION_TYPE + " must be one of %s, %s", ATTR_POSITION_TYPE_TARGET, ATTR_POSITION_TYPE_CURRENT)
         _LOGGER.debug(self._name + ': ' + 'set_known_position :: position  %d, confident %s, position_type %s, self.tc.is_traveling%s', position, str(confident), position_type, str(self.tc.is_traveling()))
-        self._assume_uncertain_position = not confident 
+        self._assume_uncertain_position = not confident
         self._processing_known_position = True
         if position_type == ATTR_POSITION_TYPE_TARGET:
-          self._target_position = position
-          position = self.current_cover_position
-
+            self._target_position = position
+            position = self.current_cover_position
 
         if self.tc.is_traveling():
-          self.tc.set_position(position)
-          self.tc.start_travel(self._target_position)
-          self.start_auto_updater()
-        else:
-          if position_type == ATTR_POSITION_TYPE_TARGET:
+            self.tc.set_position(position)
             self.tc.start_travel(self._target_position)
             self.start_auto_updater()
-          else:
-            _LOGGER.debug(self._name + ': ' + 'set_known_position :: non_traveling position  %d, confident %s, position_type %s', position, str(confident), position_type)
-            self.tc.set_position(position)
+        else:
+            if position_type == ATTR_POSITION_TYPE_TARGET:
+                self.tc.start_travel(self._target_position)
+                self.start_auto_updater()
+            else:
+                _LOGGER.debug(self._name + ': ' + 'set_known_position :: non_traveling position  %d, confident %s, position_type %s', position, str(confident), position_type)
+                self.tc.set_position(position)
 
     async def auto_stop_if_necessary(self):
         """Do auto stop if necessary."""
@@ -404,23 +452,40 @@ class CoverTimeBased(CoverEntity, RestoreEntity):
         """We have cover.* triggered command. Reset assumed state and known_position processsing and execute"""
         self._assume_uncertain_position = True
         self._processing_known_position = False
+        cmd = "UNKNOWN"
+
         if command == "close_cover":
             cmd = "DOWN"
             self._state = False
-            await self.hass.services.async_call("homeassistant", "turn_off", {"entity_id": self._open_switch_entity_id}, False)
-            await self.hass.services.async_call("homeassistant", "turn_on", {"entity_id": self._close_switch_entity_id}, False)
+
+            if self._cover_control_mode == CoverControlMode.cover_controlled:
+                await self.hass.services.async_call("cover", "close_cover", {"entity_id": self._cover_entity_id}, False)
+
+            if self._cover_control_mode == CoverControlMode.switch_controlled:
+                await self.hass.services.async_call("homeassistant", "turn_off", {"entity_id": self._open_switch_entity_id}, False)
+                await self.hass.services.async_call("homeassistant", "turn_on", {"entity_id": self._close_switch_entity_id}, False)
 
         elif command == "open_cover":
             cmd = "UP"
             self._state = True
-            await self.hass.services.async_call("homeassistant", "turn_off", {"entity_id": self._close_switch_entity_id}, False)
-            await self.hass.services.async_call("homeassistant", "turn_on", {"entity_id": self._open_switch_entity_id}, False)
+
+            if self._cover_control_mode == CoverControlMode.cover_controlled:
+                await self.hass.services.async_call("cover", "open_cover", {"entity_id": self._cover_entity_id}, False)
+
+            if self._cover_control_mode == CoverControlMode.switch_controlled:
+                await self.hass.services.async_call("homeassistant", "turn_off", {"entity_id": self._close_switch_entity_id}, False)
+                await self.hass.services.async_call("homeassistant", "turn_on", {"entity_id": self._open_switch_entity_id}, False)
 
         elif command == "stop_cover":
             cmd = "STOP"
             self._state = True
-            await self.hass.services.async_call("homeassistant", "turn_off", {"entity_id": self._open_switch_entity_id}, False)
-            await self.hass.services.async_call("homeassistant", "turn_off", {"entity_id": self._close_switch_entity_id}, False)
+
+            if self._cover_control_mode == CoverControlMode.cover_controlled:
+                await self.hass.services.async_call("cover", "stop_cover", {"entity_id": self._cover_entity_id}, False)
+
+            if self._cover_control_mode == CoverControlMode.switch_controlled:
+                await self.hass.services.async_call("homeassistant", "turn_off", {"entity_id": self._open_switch_entity_id}, False)
+                await self.hass.services.async_call("homeassistant", "turn_off", {"entity_id": self._close_switch_entity_id}, False)
 
         _LOGGER.debug(self._name + ': ' + '_async_handle_command :: %s', cmd)
 

@@ -1,0 +1,10 @@
+{
+    "domain": "cover_synced",
+    "name": "Cover Time Based Synced",
+    "version": "0.1.0",
+    "documentation": "https://github.com/berrywhite96/ha-cover-time-based-synced",
+    "issue_tracker": "https://github.com/berrywhite96/ha-cover-time-based-synced/issues",
+    "requirements": [],
+    "codeowners": ["@kotborealis", "@berrywhite"],
+    "iot_class": "local_push"
+}
